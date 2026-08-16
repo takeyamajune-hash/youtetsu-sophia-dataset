@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>養哲塾 類似生徒検索ツール（内部用）</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  body { margin:0; font-family:'Hiragino Sans','Noto Sans JP',sans-serif; background:#F7F9FB; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+
+const NAVY = "#1B4F72";
+const TEAL = "#3E8FA6";
+const AMBER = "#E8A33D";
+const CORAL = "#C0392B";
+const GREEN = "#2E8B47";
+const CARDBG = "#F4F6FC";
+const WHITE = "#FFFFFF";
+
+// ---- 学年・月のラベル変換（データ内は全角表記） ----
+const GRADE_LABELS = { 1: "１年", 2: "２年", 3: "３年" };
+const MONTH_OPTIONS = ["４月","５月","６月","７月","８月","９月","１０月","１１月","１２月","１月","２月","３月"];
+const NAISHIN_SUBJECTS = ["国語","社会","数学","理科","英語","音楽","美術","体育","技家"];
+const TEIKI_SUBJECTS = ["国語","数学","英語","社会","理科"];
+
+function yen(n){ return n; }
+
+function useDataset() {
+  const [data, setData] = React.useState(null);
+  React.useEffect(() => {
+    fetch("./dataset_bundle.json").then(r => r.json()).then(setData).catch(e => console.error(e));
+  }, []);
+  return data;
+}
+
+// ---- 候補プールの構築：指定した学年・学期・CT月に該当する生徒データを結合 ----
+function buildCandidatePool(data, grade, term, ctMonth) {
+  const gradeLabel = GRADE_LABELS[grade];
+  const naishinMap = {};
+  data.naishin.filter(r => r.学年 === grade && r.学期 === term).forEach(r => { naishinMap[r.会員番号] = r; });
+  const teikiMap = {};
+  data.teiki.filter(r => r.学年 === grade && r.学期 === term && r.種別 === "期末").forEach(r => { teikiMap[r.会員番号] = r; });
+  const ctMap = {};
+  data.ct.filter(r => r.CT学年 === gradeLabel && r.CT月 === ctMonth).forEach(r => { ctMap[r.会員番号] = r; });
+
+  return data.students.map(s => {
+    const n = naishinMap[s.会員番号];
+    const t = teikiMap[s.会員番号];
+    const c = ctMap[s.会員番号];
+    const flat = { 会員番号: s.会員番号, 氏名: s.氏名, 学校名: s.学校名, 卒業コホート: s.卒業コホート, 受験校: s.受験校, 合否: s.合否, 卒業時換算内申: s.卒業時換算内申 };
+    NAISHIN_SUBJECTS.forEach(sub => { flat["naishin_" + sub] = n ? n[sub] : null; });
+    flat["naishin_換算内申"] = n ? n["換算内申"] : null;
+    TEIKI_SUBJECTS.forEach(sub => { flat["teiki_" + sub] = t ? t[sub] : null; });
+    flat["ct_数"] = c ? c["数"] : null;
+    flat["ct_英"] = c ? c["英"] : null;
+    return flat;
+  }).filter(r => Object.keys(r).some(k => k.includes("_") && r[k] != null)); // 何かしらデータがある生徒のみ
+}
+
+// ---- z-score距離計算（入力された項目のみを使う） ----
+function computeDistances(pool, target) {
+  const keys = Object.keys(target).filter(k => target[k] !== null && target[k] !== "" && !isNaN(target[k]));
+  if (keys.length === 0) return [];
+  const stats = {};
+  keys.forEach(k => {
+    const vals = pool.map(p => p[k]).filter(v => v != null && !isNaN(v));
+    if (vals.length === 0) { stats[k] = null; return; }
+    const mean = vals.reduce((a,b)=>a+Number(b),0) / vals.length;
+    const variance = vals.reduce((a,b)=>a+(Number(b)-mean)**2,0) / vals.length;
+    stats[k] = { mean, std: Math.sqrt(variance) || 1 };
+  });
+  return pool.map(p => {
+    let sumsq = 0, used = 0;
+    keys.forEach(k => {
+      if (p[k] != null && !isNaN(p[k]) && stats[k]) {
+        const z1 = (Number(p[k]) - stats[k].mean) / stats[k].std;
+        const z2 = (Number(target[k]) - stats[k].mean) / stats[k].std;
+        sumsq += (z1 - z2) ** 2;
+        used++;
+      }
+    });
+    return { ...p, _distance: used > 0 ? Math.sqrt(sumsq / used) : Infinity, _usedCount: used };
+  }).filter(p => p._usedCount > 0 && isFinite(p._distance)).sort((a,b) => a._distance - b._distance);
+}
+
+function percentileOf(pool, key, value) {
+  const vals = pool.map(p => p[key]).filter(v => v != null && !isNaN(v)).map(Number);
+  if (vals.length === 0 || value == null || isNaN(value)) return null;
+  const below = vals.filter(v => v <= Number(value)).length;
+  return Math.round((below / vals.length) * 100);
+}
+
+// ---- 共通の入力フォーム部品 ----
+function NumberBox({ label, value, onChange, max }) {
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:4 }}>
+      <label style={{ fontSize:12, color:"#555" }}>{label}</label>
+      <input type="number" value={value} max={max} min={0}
+        onChange={e => onChange(e.target.value)}
+        placeholder="未入力可"
+        style={{ width:70, padding:"6px 8px", border:"1.5px solid #ccc", borderRadius:6, fontSize:14 }} />
+    </div>
+  );
+}
+
+function Select({ label, value, onChange, options }) {
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:4 }}>
+      <label style={{ fontSize:12, color:"#555" }}>{label}</label>
+      <select value={value} onChange={e => onChange(Number(e.target.value) || e.target.value)}
+        style={{ padding:"7px 8px", border:"1.5px solid #ccc", borderRadius:6, fontSize:14 }}>
+        {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+      </select>
+    </div>
+  );
+}
+
+function SectionCard({ title, color, children }) {
+  return (
+    <div style={{ background:CARDBG, borderRadius:10, padding:18, marginBottom:16, border:`1.5px solid ${color}33` }}>
+      <div style={{ fontWeight:700, color, fontSize:14, marginBottom:12 }}>{title}</div>
+      {children}
+    </div>
+  );
+}
+
+function ResultsTable({ results, showPercentileCols }) {
+  if (results.length === 0) return <div style={{ color:"#999", fontSize:13 }}>該当する歴代データがありません。入力項目を減らすか、条件を変えてみてください。</div>;
+  return (
+    <div style={{ overflowX:"auto" }}>
+      <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+        <thead>
+          <tr style={{ background:NAVY, color:WHITE }}>
+            <th style={th}>氏名</th><th style={th}>学校</th><th style={th}>卒業年度</th>
+            <th style={th}>受験校</th><th style={th}>結果</th><th style={th}>卒業時換算内申</th>
+            <th style={th}>類似度距離</th><th style={th}>使用項目数</th>
+          </tr>
+        </thead>
+        <tbody>
+          {results.slice(0,5).map((r,i) => (
+            <tr key={r.会員番号} style={{ background: i%2===0 ? WHITE : "#FAFBFD" }}>
+              <td style={td}>{r.氏名}</td>
+              <td style={td}>{r.学校名}</td>
+              <td style={td}>{r.卒業コホート}年度卒</td>
+              <td style={td}>{r.受験校 || "—"}</td>
+              <td style={{...td, fontWeight:700, color: r.合否==="合格" ? GREEN : CORAL}}>{r.合否 || "—"}</td>
+              <td style={td}>{r.卒業時換算内申 === 0 ? "対象外(私立単願等)" : r.卒業時換算内申}</td>
+              <td style={td}>{r._distance.toFixed(3)}</td>
+              <td style={td}>{r._usedCount}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+const th = { padding:"8px 10px", textAlign:"left", fontWeight:700 };
+const td = { padding:"8px 10px", borderBottom:"1px solid #eee" };
+
+// ============================================================
+// メインアプリ
+// ============================================================
+function App() {
+  const data = useDataset();
+  const [tab, setTab] = React.useState("new");
+
+  const [grade, setGrade] = React.useState(1);
+  const [term, setTerm] = React.useState(1);
+  const [ctMonth, setCtMonth] = React.useState("５月");
+
+  const [naishinInput, setNaishinInput] = React.useState({});
+  const [teikiInput, setTeikiInput] = React.useState({});
+  const [ctMath, setCtMath] = React.useState("");
+  const [ctEnglish, setCtEnglish] = React.useState("");
+
+  const [results, setResults] = React.useState(null);
+  const [pool, setPool] = React.useState(null);
+
+  function handleSearch() {
+    if (!data) return;
+    const p = buildCandidatePool(data, grade, term, ctMonth);
+    const target = {};
+    NAISHIN_SUBJECTS.forEach(s => { if (naishinInput[s] !== undefined && naishinInput[s] !== "") target["naishin_" + s] = Number(naishinInput[s]); });
+    TEIKI_SUBJECTS.forEach(s => { if (teikiInput[s] !== undefined && teikiInput[s] !== "") target["teiki_" + s] = Number(teikiInput[s]); });
+    if (ctMath !== "") target["ct_数"] = Number(ctMath);
+    if (ctEnglish !== "") target["ct_英"] = Number(ctEnglish);
+
+    const dist = computeDistances(p, target);
+    setResults(dist);
+    setPool(p);
+  }
+
+  if (!data) {
+    return <div style={{ padding:40, fontFamily:"sans-serif" }}>データを読み込んでいます…</div>;
+  }
+
+  return (
+    <div style={{ maxWidth:960, margin:"0 auto", padding:"24px 20px 60px" }}>
+      <div style={{ background:NAVY, color:WHITE, padding:"20px 24px", borderRadius:12, marginBottom:20 }}>
+        <div style={{ fontSize:12, letterSpacing:2, color:"#9CC3D5", marginBottom:4 }}>PRIVATE ACADEMY OF SOPHIA ｜ 内部用</div>
+        <div style={{ fontSize:24, fontWeight:800 }}>類似生徒検索ツール</div>
+        <div style={{ fontSize:13, color:"#CFE0EC", marginTop:6 }}>歴代生徒データをもとに、入塾判定・進路指導の客観的な参考資料を提示します</div>
+      </div>
+
+      <div style={{ display:"flex", gap:10, marginBottom:20 }}>
+        <button onClick={() => { setTab("new"); setResults(null); }}
+          style={{ flex:1, padding:"12px 0", borderRadius:8, border:"none", cursor:"pointer",
+            background: tab==="new" ? AMBER : WHITE, color: tab==="new" ? WHITE : "#555",
+            fontWeight:700, fontSize:14, boxShadow: tab==="new" ? "none" : "0 1px 3px rgba(0,0,0,0.1)" }}>
+          ① 新規入塾者を判定する
+        </button>
+        <button onClick={() => { setTab("current"); setResults(null); }}
+          style={{ flex:1, padding:"12px 0", borderRadius:8, border:"none", cursor:"pointer",
+            background: tab==="current" ? TEAL : WHITE, color: tab==="current" ? WHITE : "#555",
+            fontWeight:700, fontSize:14, boxShadow: tab==="current" ? "none" : "0 1px 3px rgba(0,0,0,0.1)" }}>
+          ② 在籍生の立ち位置を見る
+        </button>
+      </div>
+
+      <SectionCard title="対象の学年・時期" color={NAVY}>
+        <div style={{ display:"flex", gap:20, flexWrap:"wrap" }}>
+          <Select label="学年" value={grade} onChange={setGrade} options={[{value:1,label:"中1"},{value:2,label:"中2"},{value:3,label:"中3"}]} />
+          <Select label="学期（内申・定期考査用）" value={term} onChange={setTerm} options={[{value:1,label:"1学期"},{value:2,label:"2学期"},{value:3,label:"3学期"}]} />
+          <Select label="CT実施月" value={ctMonth} onChange={setCtMonth} options={MONTH_OPTIONS.map(m => ({value:m,label:m}))} />
+        </div>
+        <div style={{ fontSize:11.5, color:"#888", marginTop:10 }}>
+          ※CTは出題範囲・構成が近い「同じ学年×同じ月」の歴代データのみと比較します。生点数（数学・英語）で比較するため、偏差値は使用しません。
+        </div>
+      </SectionCard>
+
+      <SectionCard title="学校の成績（内申・5段階評定／わかる教科だけで構いません）" color={TEAL}>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(80px,1fr))", gap:12 }}>
+          {NAISHIN_SUBJECTS.map(s => (
+            <NumberBox key={s} label={s} max={5}
+              value={naishinInput[s] ?? ""}
+              onChange={v => setNaishinInput({...naishinInput, [s]: v})} />
+          ))}
+        </div>
+      </SectionCard>
+
+      <SectionCard title="直近の定期考査の点数（5教科／わかる教科だけで構いません）" color={AMBER}>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(80px,1fr))", gap:12 }}>
+          {TEIKI_SUBJECTS.map(s => (
+            <NumberBox key={s} label={s} max={100}
+              value={teikiInput[s] ?? ""}
+              onChange={v => setTeikiInput({...teikiInput, [s]: v})} />
+          ))}
+        </div>
+      </SectionCard>
+
+      <SectionCard title="入塾テスト（CT）の点数（数学・英語、100点満点）" color={CORAL}>
+        <div style={{ display:"flex", gap:16 }}>
+          <NumberBox label="数学" max={100} value={ctMath} onChange={setCtMath} />
+          <NumberBox label="英語" max={100} value={ctEnglish} onChange={setCtEnglish} />
+        </div>
+      </SectionCard>
+
+      <button onClick={handleSearch}
+        style={{ width:"100%", padding:"14px 0", background:NAVY, color:WHITE, border:"none",
+          borderRadius:8, fontSize:16, fontWeight:700, cursor:"pointer", marginBottom:24 }}>
+        {tab === "new" ? "似ている歴代生徒を検索する" : "立ち位置を確認する"}
+      </button>
+
+      {results !== null && (
+        <div style={{ background:WHITE, borderRadius:12, padding:20, boxShadow:"0 2px 8px rgba(0,0,0,0.06)" }}>
+          <div style={{ fontWeight:700, fontSize:15, color:NAVY, marginBottom:6 }}>
+            似ている歴代生徒トップ5（{results.length}名中）
+          </div>
+          <div style={{ fontSize:12, color:"#888", marginBottom:14 }}>
+            入力した項目だけを使って類似度を計算しています。「使用項目数」が少ないほど、参考精度は下がります。
+          </div>
+          <ResultsTable results={results} />
+
+          {tab === "current" && pool && (
+            <div style={{ marginTop:24, paddingTop:20, borderTop:"1px solid #eee" }}>
+              <div style={{ fontWeight:700, fontSize:15, color:TEAL, marginBottom:10 }}>歴代生徒の中での立ち位置（パーセンタイル）</div>
+              <div style={{ display:"flex", gap:16, flexWrap:"wrap" }}>
+                {["naishin_換算内申","teiki_国語","teiki_数学","teiki_英語","ct_数","ct_英"].map(k => {
+                  const targetVal = k.startsWith("naishin_") ? null
+                    : k.startsWith("teiki_") ? teikiInput[k.replace("teiki_","")]
+                    : k === "ct_数" ? ctMath : ctEnglish;
+                  const pct = targetVal !== "" && targetVal != null ? percentileOf(pool, k, targetVal) : null;
+                  if (pct === null) return null;
+                  return (
+                    <div key={k} style={{ background:CARDBG, borderRadius:8, padding:"12px 16px", minWidth:120 }}>
+                      <div style={{ fontSize:11, color:"#666" }}>{k.split("_")[1]}</div>
+                      <div style={{ fontSize:22, fontWeight:800, color:TEAL }}>上位{100-pct}%</div>
+                      <div style={{ fontSize:10, color:"#999" }}>同学年・同時期の歴代生徒内</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>
