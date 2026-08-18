@@ -4,7 +4,16 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>養哲塾 類似生徒検索ツール（内部用）</title>
-<style>body { margin:0; font-family:'Hiragino Sans','Noto Sans JP',sans-serif; background:#F7F9FB; }</style>
+<style>
+  body { margin:0; font-family:'Hiragino Sans','Noto Sans JP',sans-serif; background:#F7F9FB; }
+  @media print {
+    body { background: #fff; }
+    .no-print { display: none !important; }
+    #print-area { box-shadow: none !important; }
+    button { display: none; }
+    #print-area button { display: none; }
+  }
+</style>
 </head>
 <body>
 <div id="root"></div>
@@ -349,9 +358,86 @@ const GRADE_LABELS = {
 const MONTH_OPTIONS = ["４月", "５月", "６月", "７月", "８月", "９月", "１０月", "１１月", "１２月", "１月", "２月", "３月"];
 const NAISHIN_SUBJECTS = ["国語", "数学", "英語", "社会", "理科", "音楽", "美術", "体育", "技家"];
 const TEIKI_SUBJECTS = ["国語", "数学", "英語", "社会", "理科"];
+
+// ---- ①回帰モデル（中1入塾者・中2入塾者、進学先偏差値を予測） ----
+const POOLED_MODEL = {
+  n: 340,
+  r2: 0.577,
+  tval: 1.9670706096623631,
+  seY: 4.103495192977817,
+  coef: {
+    const: 29.206243,
+    naishin: 0.007916,
+    teiki: 0.322798,
+    ctMath: 0.057245,
+    ctEng: 0.027131
+  },
+  confidence: "高"
+};
+// 学年別に分けたモデル（中1のみ・中2のみ）と、学年を区別しない統合モデルをF検定で比較した結果、
+// 学年による関係の違いは統計的に確認できなかった（p=0.214）。そのため中1〜3すべてに同じ統合モデルを適用する。
+const REGRESSION_MODELS = {
+  1: POOLED_MODEL,
+  2: POOLED_MODEL,
+  3: POOLED_MODEL
+};
+function predictHensachi(grade, naishin, teiki, ctMath, ctEng) {
+  const m = REGRESSION_MODELS[grade];
+  if (!m) return null;
+  const c = m.coef;
+  const pred = c.const + c.naishin * naishin + c.teiki * teiki + c.ctMath * ctMath + c.ctEng * ctEng;
+  return {
+    pred,
+    lower: pred - m.tval * m.seY,
+    upper: pred + m.tval * m.seY,
+    n: m.n,
+    r2: m.r2,
+    confidence: m.confidence
+  };
+}
 function yen(n) {
   return n;
 }
+
+// ---- ②伸びの計算：ある生徒の入塾時→卒業時の内申・CT偏差値の変化 ----
+function computeGrowth(data, memberId) {
+  const naishinRows = data.naishin.filter(r => r.会員番号 === memberId && r["換算内申"] != null && !isNaN(Number(r["換算内申"])) && Number(r["換算内申"]) > 0).sort((a, b) => a.学年 * 10 + a.学期 - (b.学年 * 10 + b.学期));
+  const ctRows = data.ct.filter(r => r.会員番号 === memberId && r.CT学年 != null && r.CT月 != null).sort((a, b) => GRADE_ORDER_G[a.CT学年] + MONTH_ORDER_G[a.CT月] - (GRADE_ORDER_G[b.CT学年] + MONTH_ORDER_G[b.CT月]));
+  const naishinStart = naishinRows.length ? Number(naishinRows[0]["換算内申"]) : null;
+  const naishinEnd = naishinRows.length ? Number(naishinRows[naishinRows.length - 1]["換算内申"]) : null;
+  function ctSS(row) {
+    if (!row) return null;
+    const v = row["5科_SS"] ?? row["3科_SS"];
+    if (v != null) return Number(v);
+    const indiv = ["国", "数", "英", "理", "社"].map(s => row[s + "_SS"]).filter(x => x != null).map(Number);
+    return indiv.length ? indiv.reduce((a, b) => a + b, 0) / indiv.length : null;
+  }
+  const ctStart = ctSS(ctRows[0]);
+  const ctEnd = ctSS(ctRows[ctRows.length - 1]);
+  return {
+    naishinGrowth: naishinStart != null && naishinEnd != null ? naishinEnd - naishinStart : null,
+    ctGrowth: ctStart != null && ctEnd != null ? ctEnd - ctStart : null
+  };
+}
+const MONTH_ORDER_G = {
+  "４月": 1,
+  "５月": 2,
+  "６月": 3,
+  "７月": 4,
+  "８月": 5,
+  "９月": 6,
+  "１０月": 7,
+  "１１月": 8,
+  "１２月": 9,
+  "１月": 10,
+  "２月": 11,
+  "３月": 12
+};
+const GRADE_ORDER_G = {
+  "１年": 0,
+  "２年": 100,
+  "３年": 200
+};
 
 // ---- 長形式（Excelの生データ）→横持ちへの変換（Pythonのpivot_tableと同じロジック） ----
 function pivotNaishin(rows) {
@@ -390,26 +476,36 @@ function pivotCT(rows) {
       CT学年: r["学年"],
       CT月: r["実施月"]
     };
-    groups[key][r["教科"]] = r["得点"];
+    groups[key][r["教科"]] = r["得点"]; // 得点（生点数）: 検索(k近傍法)で使用
+    groups[key][r["教科"] + "_SS"] = r["偏差値"]; // 偏差値: 伸びの計算で使用
   });
   return Object.values(groups);
 }
 
 // ---- Excelワークブックから、ツールが使う4テーブルを組み立てる ----
+function trimKeys(rows) {
+  return rows.map(r => {
+    const out = {};
+    Object.keys(r).forEach(k => {
+      out[String(k).trim()] = r[k];
+    });
+    return out;
+  });
+}
 function parseWorkbook(workbook) {
   const sheet = name => {
     const ws = workbook.Sheets[name];
     if (!ws) throw new Error(`シート「${name}」が見つかりません。`);
-    return XLSX.utils.sheet_to_json(ws, {
+    return trimKeys(XLSX.utils.sheet_to_json(ws, {
       defval: null
-    });
+    }));
   };
   const rosterRaw = sheet("生徒マスタ");
   const students = rosterRaw.filter(r => r["合否"] != null && r["合否"] !== "").map(r => ({
     会員番号: r["会員番号"],
     氏名: r["氏名"],
     学校名: r["学校名"],
-    卒業コホート: r["卒業コホート"],
+    卒業コホート: r["卒業コホート"] != null ? r["卒業コホート"] : r["卒業年度"],
     受験校: r["受験校"],
     卒業時換算内申: r["換算内申"],
     合否: r["合否"]
@@ -463,14 +559,19 @@ function buildCandidatePool(data, grade, term, ctMonth) {
     naishinMap[r.会員番号] = r;
   });
   const teikiMap = {};
-  data.teiki.filter(r => r.学年 === grade && r.学期 === term && r.種別 === "期末").forEach(r => {
+  // 期末を優先。期末データが存在しない学年・学期（中1など）は中間で代用する
+  const teikiFinal = data.teiki.filter(r => r.学年 === grade && r.学期 === term && r.種別 === "期末");
+  const teikiMid = data.teiki.filter(r => r.学年 === grade && r.学期 === term && r.種別 === "中間");
+  const teikiSource = teikiFinal.length > 0 ? teikiFinal : teikiMid;
+  const teikiIsMid = teikiFinal.length === 0;
+  teikiSource.forEach(r => {
     teikiMap[r.会員番号] = r;
   });
   const ctMap = {};
   data.ct.filter(r => r.CT学年 === gradeLabel && r.CT月 === ctMonth).forEach(r => {
     ctMap[r.会員番号] = r;
   });
-  return data.students.map(s => {
+  const result = data.students.map(s => {
     const n = naishinMap[s.会員番号];
     const t = teikiMap[s.会員番号];
     const c = ctMap[s.会員番号];
@@ -494,6 +595,8 @@ function buildCandidatePool(data, grade, term, ctMonth) {
     flat["ct_英"] = c ? c["英"] : null;
     return flat;
   }).filter(r => Object.keys(r).some(k => k.includes("_") && r[k] != null)); // 何かしらデータがある生徒のみ
+  result._teikiIsMid = teikiIsMid;
+  return result;
 }
 
 // ---- z-score距離計算（入力された項目のみを使う） ----
@@ -530,7 +633,7 @@ function computeDistances(pool, target) {
       _distance: used > 0 ? Math.sqrt(sumsq / used) : Infinity,
       _usedCount: used
     };
-  }).filter(p => p._usedCount > 0 && isFinite(p._distance)).sort((a, b) => a._distance - b._distance);
+  }).filter(p => p._usedCount >= 4 && isFinite(p._distance)).sort((a, b) => b._usedCount - a._usedCount || a._distance - b._distance);
 }
 function percentileOf(pool, key, value) {
   const vals = pool.map(p => p[key]).filter(v => v != null && !isNaN(v)).map(Number);
@@ -713,9 +816,44 @@ function SectionCard({
     }
   }, title), children);
 }
+function LowCountWarning({
+  count
+}) {
+  if (count >= 5) return null;
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: "#FFF0EC",
+      border: `2px solid ${CORAL}`,
+      borderRadius: 8,
+      padding: "12px 16px",
+      marginBottom: 14,
+      display: "flex",
+      alignItems: "center",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 20
+    }
+  }, "⚠️"), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 800,
+      color: CORAL,
+      fontSize: 14
+    }
+  }, "該当する歴代データが", count, "件しかありません"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: "#a04a3a",
+      marginTop: 2
+    }
+  }, "母数が少ないため、この結果はあくまで参考程度に留めてください。入力項目を減らす、または条件を変えると件数が増える場合があります。")));
+}
 function ResultsTable({
   results,
-  onSelect
+  onSelect,
+  data,
+  anonymize
 }) {
   if (results.length === 0) return /*#__PURE__*/React.createElement("div", {
     style: {
@@ -723,7 +861,10 @@ function ResultsTable({
       fontSize: 13
     }
   }, "該当する歴代データがありません。入力項目を減らすか、条件を変えてみてください。");
-  return /*#__PURE__*/React.createElement("div", {
+  const anonLabel = i => "生徒" + String.fromCharCode(65 + i);
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(LowCountWarning, {
+    count: results.length
+  }), /*#__PURE__*/React.createElement("div", {
     style: {
       overflowX: "auto"
     }
@@ -752,50 +893,80 @@ function ResultsTable({
     style: th
   }, "卒業時換算内申"), /*#__PURE__*/React.createElement("th", {
     style: th
+  }, "内申の伸び"), /*#__PURE__*/React.createElement("th", {
+    style: th
+  }, "CTの伸び"), /*#__PURE__*/React.createElement("th", {
+    style: th
   }, "類似度距離"), /*#__PURE__*/React.createElement("th", {
     style: th
   }, "使用項目数"), /*#__PURE__*/React.createElement("th", {
     style: th
-  }))), /*#__PURE__*/React.createElement("tbody", null, results.slice(0, 5).map((r, i) => /*#__PURE__*/React.createElement("tr", {
-    key: r.会員番号,
+  }))), /*#__PURE__*/React.createElement("tbody", null, results.slice(0, 5).map((r, i) => {
+    const growth = data ? computeGrowth(data, r.会員番号) : {
+      naishinGrowth: null,
+      ctGrowth: null
+    };
+    const fmtGrowth = v => v == null ? "—" : (v > 0 ? "+" : "") + v.toFixed(1);
+    const growthColor = v => v == null ? "#999" : v > 0 ? GREEN : v < 0 ? CORAL : "#555";
+    return /*#__PURE__*/React.createElement("tr", {
+      key: r.会員番号,
+      style: {
+        background: i % 2 === 0 ? WHITE : "#FAFBFD"
+      }
+    }, /*#__PURE__*/React.createElement("td", {
+      style: td
+    }, anonymize ? anonLabel(i) : r.氏名), /*#__PURE__*/React.createElement("td", {
+      style: td
+    }, r.学校名), /*#__PURE__*/React.createElement("td", {
+      style: td
+    }, r.卒業コホート != null && r.卒業コホート !== "" ? r.卒業コホート + "年度卒" : "卒業年度不明"), /*#__PURE__*/React.createElement("td", {
+      style: td
+    }, r.受験校 || "—"), /*#__PURE__*/React.createElement("td", {
+      style: {
+        ...td,
+        fontWeight: 700,
+        color: r.合否 === "合格" ? GREEN : CORAL
+      }
+    }, r.合否 || "—"), /*#__PURE__*/React.createElement("td", {
+      style: td
+    }, r.卒業時換算内申 === 0 ? "対象外(私立単願等)" : r.卒業時換算内申), /*#__PURE__*/React.createElement("td", {
+      style: {
+        ...td,
+        fontWeight: 700,
+        color: growthColor(growth.naishinGrowth)
+      }
+    }, fmtGrowth(growth.naishinGrowth)), /*#__PURE__*/React.createElement("td", {
+      style: {
+        ...td,
+        fontWeight: 700,
+        color: growthColor(growth.ctGrowth)
+      }
+    }, fmtGrowth(growth.ctGrowth)), /*#__PURE__*/React.createElement("td", {
+      style: td
+    }, r._distance.toFixed(3)), /*#__PURE__*/React.createElement("td", {
+      style: td
+    }, r._usedCount), /*#__PURE__*/React.createElement("td", {
+      style: td
+    }, /*#__PURE__*/React.createElement("button", {
+      onClick: () => onSelect(r.会員番号),
+      style: {
+        background: TEAL,
+        color: WHITE,
+        border: "none",
+        borderRadius: 6,
+        padding: "5px 12px",
+        fontSize: 12,
+        fontWeight: 700,
+        cursor: "pointer"
+      }
+    }, "詳細")));
+  })))), /*#__PURE__*/React.createElement("div", {
     style: {
-      background: i % 2 === 0 ? WHITE : "#FAFBFD"
+      fontSize: 10.5,
+      color: "#aaa",
+      marginTop: 6
     }
-  }, /*#__PURE__*/React.createElement("td", {
-    style: td
-  }, r.氏名), /*#__PURE__*/React.createElement("td", {
-    style: td
-  }, r.学校名), /*#__PURE__*/React.createElement("td", {
-    style: td
-  }, r.卒業コホート, "年度卒"), /*#__PURE__*/React.createElement("td", {
-    style: td
-  }, r.受験校 || "—"), /*#__PURE__*/React.createElement("td", {
-    style: {
-      ...td,
-      fontWeight: 700,
-      color: r.合否 === "合格" ? GREEN : CORAL
-    }
-  }, r.合否 || "—"), /*#__PURE__*/React.createElement("td", {
-    style: td
-  }, r.卒業時換算内申 === 0 ? "対象外(私立単願等)" : r.卒業時換算内申), /*#__PURE__*/React.createElement("td", {
-    style: td
-  }, r._distance.toFixed(3)), /*#__PURE__*/React.createElement("td", {
-    style: td
-  }, r._usedCount), /*#__PURE__*/React.createElement("td", {
-    style: td
-  }, /*#__PURE__*/React.createElement("button", {
-    onClick: () => onSelect(r.会員番号),
-    style: {
-      background: TEAL,
-      color: WHITE,
-      border: "none",
-      borderRadius: 6,
-      padding: "5px 12px",
-      fontSize: 12,
-      fontWeight: 700,
-      cursor: "pointer"
-    }
-  }, "詳細")))))));
+  }, "※「内申の伸び」「CTの伸び」は、その生徒の在籍中の最初の記録から最後の記録までの変化量です。"));
 }
 const th = {
   padding: "8px 10px",
@@ -939,7 +1110,9 @@ function getStudentDetail(data, memberId) {
 function StudentDetailView({
   data,
   memberId,
-  onClose
+  onClose,
+  anonymize,
+  results
 }) {
   const {
     meta,
@@ -949,6 +1122,8 @@ function StudentDetailView({
   } = getStudentDetail(data, memberId);
   if (!meta) return null;
   const ctSubjectsPresent = ["国", "数", "英", "社", "理"].filter(s => ctRows.some(r => r[s] != null));
+  const idx = results ? results.findIndex(r => r.会員番号 === memberId) : -1;
+  const displayName = anonymize ? "生徒" + String.fromCharCode(65 + (idx >= 0 ? idx : 0)) : meta.氏名;
   return /*#__PURE__*/React.createElement("div", {
     style: {
       position: "fixed",
@@ -999,13 +1174,13 @@ function StudentDetailView({
       color: NAVY,
       marginBottom: 4
     }
-  }, meta.氏名), /*#__PURE__*/React.createElement("div", {
+  }, displayName), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 13,
       color: "#666",
       marginBottom: 16
     }
-  }, meta.学校名, "｜", meta.卒業コホート, "年度卒"), /*#__PURE__*/React.createElement("div", {
+  }, meta.学校名, "｜", meta.卒業コホート != null && meta.卒業コホート !== "" ? meta.卒業コホート + "年度卒" : "卒業年度不明"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 12,
@@ -1225,6 +1400,7 @@ function App() {
   const [naishinInput, setNaishinInput] = React.useState({});
   const [teikiInput, setTeikiInput] = React.useState({});
   const [ctInput, setCtInput] = React.useState({});
+  const [predNaishin, setPredNaishin] = React.useState("");
   const CT_LABELS = {
     国: "国語",
     数: "数学",
@@ -1235,6 +1411,8 @@ function App() {
   const ctSubjects = tab === "new" ? ["数", "英"] : grade <= 2 ? ["国", "数", "英"] : ["国", "数", "英", "社", "理"];
   const [results, setResults] = React.useState(null);
   const [selectedStudent, setSelectedStudent] = React.useState(null);
+  const [anonymize, setAnonymize] = React.useState(false);
+  const anonLabel = i => "生徒" + String.fromCharCode(65 + i);
   const [pool, setPool] = React.useState(null);
   const fileInputRef = React.useRef(null);
   function handleSearch() {
@@ -1307,8 +1485,27 @@ function App() {
       fontSize: 11.5,
       color: "#9CC3D5"
     }
-  }, "読み込み中のデータ: ", fileName, "（", data.students.length, "名分）"), /*#__PURE__*/React.createElement("button", {
+  }, "読み込み中のデータ: ", fileName, "（", data.students.length, "名分）"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setAnonymize(!anonymize),
+    className: "no-print",
+    style: {
+      fontSize: 11.5,
+      color: WHITE,
+      background: anonymize ? AMBER : "transparent",
+      border: `1px solid ${anonymize ? AMBER : "#5A8DAC"}`,
+      borderRadius: 6,
+      padding: "4px 10px",
+      cursor: "pointer",
+      fontWeight: anonymize ? 700 : 400
+    }
+  }, anonymize ? "🔒 匿名化中（解除する）" : "🔓 生徒名を匿名化"), /*#__PURE__*/React.createElement("button", {
     onClick: () => fileInputRef.current.click(),
+    className: "no-print",
     style: {
       fontSize: 11.5,
       color: WHITE,
@@ -1318,7 +1515,7 @@ function App() {
       padding: "4px 10px",
       cursor: "pointer"
     }
-  }, "別のファイルを読み込む"), /*#__PURE__*/React.createElement("input", {
+  }, "別のファイルを読み込む")), /*#__PURE__*/React.createElement("input", {
     ref: fileInputRef,
     type: "file",
     accept: ".xlsx",
@@ -1492,6 +1689,7 @@ function App() {
       marginBottom: 24
     }
   }, tab === "new" ? "似ている歴代生徒を検索する" : "立ち位置を確認する"), results !== null && /*#__PURE__*/React.createElement("div", {
+    id: "print-area",
     style: {
       background: WHITE,
       borderRadius: 12,
@@ -1500,21 +1698,52 @@ function App() {
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: {
-      fontWeight: 700,
-      fontSize: 15,
-      color: NAVY,
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
       marginBottom: 6
     }
-  }, "似ている歴代生徒トップ5（", results.length, "名中）"), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      fontSize: 15,
+      color: NAVY
+    }
+  }, "似ている歴代生徒トップ5（", results.length, "名中）"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => window.print(),
+    className: "no-print",
+    style: {
+      background: "#EEE",
+      color: "#444",
+      border: "none",
+      borderRadius: 6,
+      padding: "6px 14px",
+      fontSize: 12,
+      fontWeight: 700,
+      cursor: "pointer"
+    }
+  }, "🖨 印刷 / PDF保存")), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 12,
       color: "#888",
       marginBottom: 14
     }
-  }, "入力した項目だけを使って類似度を計算しています。「使用項目数」が少ないほど、参考精度は下がります。"), /*#__PURE__*/React.createElement(ResultsTable, {
+  }, "入力した項目だけを使って類似度を計算しています。使用項目数が4件未満の生徒は候補から除外し、使用項目数が多い順→その中で類似度が近い順に並べています。"), pool && pool._teikiIsMid && /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: "#FFF3D6",
+      border: "1px solid #E0B84A",
+      borderRadius: 6,
+      padding: "8px 12px",
+      fontSize: 11.5,
+      color: "#8a6a1f",
+      marginBottom: 14
+    }
+  }, "※この学年・学期は期末テストのデータが存在しないため、定期考査の欄は「中間テスト」の結果で代用しています。"), /*#__PURE__*/React.createElement(ResultsTable, {
     results: results,
-    onSelect: setSelectedStudent
-  }), tab === "current" && pool && /*#__PURE__*/React.createElement("div", {
+    onSelect: setSelectedStudent,
+    data: data,
+    anonymize: anonymize
+  }), /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 24,
       paddingTop: 20,
@@ -1524,29 +1753,128 @@ function App() {
     style: {
       fontWeight: 700,
       fontSize: 15,
-      color: TEAL,
+      color: AMBER,
+      marginBottom: 4
+    }
+  }, "統計モデルによる進学先偏差値の予測"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#999",
       marginBottom: 10
     }
-  }, "歴代生徒の中での立ち位置"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 16,
-      flexWrap: "wrap"
+  }, "中1〜中3、入塾学年を区別しない統合モデル（学年による関係の違いは統計的に確認されなかったため）"), (() => {
+    const m = REGRESSION_MODELS[grade];
+    if (!m) {
+      return /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 12.5,
+          color: "#999"
+        }
+      }, "この学年（中", grade, "）は、予測モデルに使えるデータがまだ十分ではありません。");
     }
-  }, ["teiki_国語", "teiki_数学", "teiki_英語", "teiki_社会", "teiki_理科", ...ctSubjects.map(s => "ct_" + s)].map(k => {
-    const targetVal = k.startsWith("teiki_") ? teikiInput[k.replace("teiki_", "")] : ctInput[k.replace("ct_", "")];
-    const pct = targetVal !== "" && targetVal != null ? percentileOf(pool, k, targetVal) : null;
-    if (pct === null) return null;
-    const label = k.startsWith("teiki_") ? "定期考査:" + k.split("_")[1] : "CT:" + CT_LABELS[k.split("_")[1]];
-    return /*#__PURE__*/React.createElement(PercentileBar, {
-      key: k,
-      label: label,
-      percentile: pct
-    });
-  })))), selectedStudent && /*#__PURE__*/React.createElement(StudentDetailView, {
+    const teikiVals = TEIKI_SUBJECTS.map(s => teikiInput[s]).filter(v => v !== undefined && v !== "").map(Number);
+    const teikiAvg = teikiVals.length ? teikiVals.reduce((a, b) => a + b, 0) / teikiVals.length : null;
+    const naishinKansan = predNaishin !== "" ? Number(predNaishin) : null;
+    const ctM = ctInput["数"] !== undefined && ctInput["数"] !== "" ? Number(ctInput["数"]) : null;
+    const ctE = ctInput["英"] !== undefined && ctInput["英"] !== "" ? Number(ctInput["英"]) : null;
+    return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        gap: 16,
+        alignItems: "flex-end",
+        flexWrap: "wrap",
+        marginBottom: 14
+      }
+    }, /*#__PURE__*/React.createElement(NumberBox, {
+      label: "換算内申（分かれば入力）",
+      max: 65,
+      value: predNaishin,
+      onChange: setPredNaishin
+    }), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11.5,
+        color: "#999",
+        paddingBottom: 8
+      }
+    }, "定期考査・CT数英は、上で入力した値をそのまま使います")), naishinKansan == null || teikiAvg == null || ctM == null || ctE == null ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 12.5,
+        color: "#999"
+      }
+    }, "換算内申・定期考査（1教科以上）・CT数学・CT英語をすべて入力すると予測が表示されます。") : (() => {
+      const r = predictHensachi(grade, naishinKansan, teikiAvg, ctM, ctE);
+      return /*#__PURE__*/React.createElement("div", {
+        style: {
+          display: "flex",
+          gap: 14,
+          flexWrap: "wrap"
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          background: "#FFF8EC",
+          border: `1.5px solid ${AMBER}`,
+          borderRadius: 8,
+          padding: "14px 20px"
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 11,
+          color: "#8a6a1f"
+        }
+      }, "予測される進学先偏差値"), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 26,
+          fontWeight: 800,
+          color: "#8a6a1f"
+        }
+      }, r.pred.toFixed(1))), /*#__PURE__*/React.createElement("div", {
+        style: {
+          background: CARDBG,
+          borderRadius: 8,
+          padding: "14px 20px"
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 11,
+          color: "#888"
+        }
+      }, "現実的な範囲（95%）"), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 18,
+          fontWeight: 700,
+          color: NAVY
+        }
+      }, r.lower.toFixed(1), " 〜 ", r.upper.toFixed(1))), /*#__PURE__*/React.createElement("div", {
+        style: {
+          background: CARDBG,
+          borderRadius: 8,
+          padding: "14px 20px"
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 11,
+          color: "#888"
+        }
+      }, "モデルの信頼度"), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 13,
+          fontWeight: 700,
+          color: NAVY
+        }
+      }, r.confidence, "（n=", r.n, ", R²=", r.r2, "）")));
+    })(), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10.5,
+        color: "#aaa",
+        marginTop: 10
+      }
+    }, "※このモデルの「CT数学・英語」は、学習データ上は各生徒が\"初めて受けたCT\"の得点です（学年は生徒により異なり、中2・中3になってからの初回になるケースが大半です）。 入力欄には、今実際に手元にあるCTの点数（入塾テスト等）をそのまま入力してください。"));
+  })())), selectedStudent && /*#__PURE__*/React.createElement(StudentDetailView, {
     data: data,
     memberId: selectedStudent,
-    onClose: () => setSelectedStudent(null)
+    onClose: () => setSelectedStudent(null),
+    anonymize: anonymize,
+    results: results
   }));
 }
 const root = ReactDOM.createRoot(document.getElementById('root'));
