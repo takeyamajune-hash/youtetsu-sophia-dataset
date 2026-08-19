@@ -612,6 +612,15 @@ function buildCandidatePool(data, grade, term, ctMonth) {
 }
 
 // ---- z-score距離計算（入力された項目のみを使う） ----
+// ---- 回帰分析（統合モデル、340名）の標準化係数を、そのまま類似度計算の重みに使う ----
+// 定期考査5教科平均=0.616／CT数学=0.184／CT英語=0.094／換算内申=0.030
+function featureWeight(key) {
+  if (key.startsWith("teiki_")) return 0.616;
+  if (key === "ct_数") return 0.184;
+  if (key === "ct_英") return 0.094;
+  if (key.startsWith("naishin_")) return 0.030;
+  return 1;
+}
 function computeDistances(pool, target) {
   const keys = Object.keys(target).filter(k => target[k] !== null && target[k] !== "" && !isNaN(target[k]));
   if (keys.length === 0) return [];
@@ -631,18 +640,21 @@ function computeDistances(pool, target) {
   });
   return pool.map(p => {
     let sumsq = 0,
-      used = 0;
+      used = 0,
+      weightSum = 0;
     keys.forEach(k => {
       if (p[k] != null && !isNaN(p[k]) && stats[k]) {
         const z1 = (Number(p[k]) - stats[k].mean) / stats[k].std;
         const z2 = (Number(target[k]) - stats[k].mean) / stats[k].std;
-        sumsq += (z1 - z2) ** 2;
+        const w = featureWeight(k);
+        sumsq += w * (z1 - z2) ** 2;
+        weightSum += w;
         used++;
       }
     });
     return {
       ...p,
-      _distance: used > 0 ? Math.sqrt(sumsq / used) : Infinity,
+      _distance: used > 0 ? Math.sqrt(sumsq / weightSum) : Infinity,
       _usedCount: used
     };
   }).filter(p => p._usedCount >= 4 && isFinite(p._distance)).sort((a, b) => b._usedCount - a._usedCount || a._distance - b._distance);
