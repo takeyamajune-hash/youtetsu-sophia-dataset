@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>養哲塾 類似生徒検索ツール（内部用）</title>
+<title>養哲塾検索ツール（内部用）</title>
 <style>
   body { margin:0; font-family:'Hiragino Sans','Noto Sans JP',sans-serif; background:#F7F9FB; }
   @media print {
@@ -513,11 +513,23 @@ function parseWorkbook(workbook) {
   const naishin = pivotNaishin(sheet("内申"));
   const teiki = pivotTeiki(sheet("定期考査"));
   const ct = pivotCT(sheet("CT結果"));
+
+  // ③志望校判定シミュレーター用のシート
+  const thresholds = sheet("基準点");
+  const practice = sheet("演習履歴");
+  const validation = sheet("検証結果");
+  const schoolProfile = sheet("合格者教科プロファイル");
+  const studentProfiles = sheet("生徒プロファイル");
   return {
     students,
     naishin,
     teiki,
-    ct
+    ct,
+    thresholds,
+    practice,
+    validation,
+    schoolProfile,
+    studentProfiles
   };
 }
 function useDataset() {
@@ -1004,6 +1016,7 @@ function ScoreTable({
       }
     }, "表示できるデータがありません。");
   }
+  const FIRST_COL_WIDTH = 170; // 「時期」列の幅を全テーブル共通で固定し、縦の列位置を揃える
   return /*#__PURE__*/React.createElement("div", {
     style: {
       overflowX: "auto"
@@ -1012,9 +1025,16 @@ function ScoreTable({
     style: {
       borderCollapse: "collapse",
       fontSize: 12.5,
-      width: "100%"
+      width: "100%",
+      tableLayout: "fixed"
     }
-  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", {
+  }, /*#__PURE__*/React.createElement("colgroup", null, /*#__PURE__*/React.createElement("col", {
+    style: {
+      width: FIRST_COL_WIDTH
+    }
+  }), subjects.map(s => /*#__PURE__*/React.createElement("col", {
+    key: s
+  }))), /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", {
     style: {
       ...thSmall,
       textAlign: "left",
@@ -1092,9 +1112,13 @@ function getStudentDetail(data, memberId) {
     ...r,
     _label: `中${r.学年}-${r.学期}学期`
   }));
-  const teikiRows = data.teiki.filter(r => r.会員番号 === memberId && r.種別 === "期末").sort((a, b) => a.学年 * 10 + a.学期 - (b.学年 * 10 + b.学期)).map(r => ({
+  const teikiRows = data.teiki.filter(r => r.会員番号 === memberId && (r.種別 === "期末" || r.種別 === "中間")).sort((a, b) => {
+    const orderA = a.学年 * 10 + a.学期 + (a.種別 === "中間" ? 0 : 0.5);
+    const orderB = b.学年 * 10 + b.学期 + (b.種別 === "中間" ? 0 : 0.5);
+    return orderA - orderB;
+  }).map(r => ({
     ...r,
-    _label: `中${r.学年}-${r.学期}学期`
+    _label: `中${r.学年}-${r.学期}学期（${r.種別}）`
   }));
   const ctRows = data.ct.filter(r => r.会員番号 === memberId && r.CT学年 != null && r.CT月 != null).sort((a, b) => GRADE_ORDER[a.CT学年] + MONTH_ORDER[a.CT月] - (GRADE_ORDER[b.CT学年] + MONTH_ORDER[b.CT月])).map(r => ({
     ...r,
@@ -1275,7 +1299,7 @@ function StudentDetailView({
       color: NAVY,
       margin: "26px 0 8px"
     }
-  }, "定期考査（期末）の推移"), /*#__PURE__*/React.createElement(ScoreTable, {
+  }, "定期考査（中間・期末）の推移"), /*#__PURE__*/React.createElement(ScoreTable, {
     rows: teikiRows,
     subjects: TEIKI_SUBJECTS,
     labels: {
@@ -1345,14 +1369,14 @@ function FileUploadScreen({
       color: NAVY,
       marginBottom: 16
     }
-  }, "類似生徒検索ツール"), /*#__PURE__*/React.createElement("p", {
+  }, "養哲塾検索ツール"), /*#__PURE__*/React.createElement("p", {
     style: {
       color: "#555",
       fontSize: 14,
       lineHeight: 1.7,
       marginBottom: 24
     }
-  }, "「養哲塾_生徒データ統合.xlsx」を選択してください。", /*#__PURE__*/React.createElement("br", null), "毎年このファイルに新しいコホートの行を追加していけば、そのまま検索データベースが更新されます。"), /*#__PURE__*/React.createElement("button", {
+  }, "「養哲塾検索ツール_データ.xlsx」を選択してください。", /*#__PURE__*/React.createElement("br", null), "毎年このファイルに新しいコホートの行を追加していけば、そのまま検索データベースが更新されます。"), /*#__PURE__*/React.createElement("button", {
     onClick: () => inputRef.current.click(),
     style: {
       padding: "14px 32px",
@@ -1386,6 +1410,560 @@ function FileUploadScreen({
     }
   }, error));
 }
+
+// ============================================================
+// ③志望校判定シミュレーター 用の関数群
+// ============================================================
+const SUBJECTS = ["国語", "数学", "英語", "社会", "理科"];
+function top3Avg(scores) {
+  const vals = scores.filter(v => v != null && v !== "" && !isNaN(Number(v))).map(Number).sort((a, b) => b - a);
+  if (vals.length === 0) return null;
+  const top = vals.slice(0, Math.min(3, vals.length));
+  return top.reduce((a, b) => a + b, 0) / top.length;
+}
+function judge(kansanTotal, target, border) {
+  if (kansanTotal >= target) return "安全圏";
+  if (kansanTotal >= border) return "ボーダー圏";
+  return "厳しいライン";
+}
+const JUDGE_COLOR = {
+  "安全圏": GREEN,
+  "ボーダー圏": AMBER,
+  "厳しいライン": CORAL
+};
+// ---- ③類似生徒検索：5教科の点数プロファイルでz-score距離を計算 ----
+function findSimilarStudents(studentProfiles, targetSubjects, excludeId) {
+  const keys = SUBJECTS.filter(s => targetSubjects[s] != null && targetSubjects[s] !== "" && !isNaN(Number(targetSubjects[s])));
+  if (keys.length === 0) return [];
+  const pool = studentProfiles.filter(p => p.会員番号 !== excludeId);
+  const stats = {};
+  keys.forEach(k => {
+    const vals = pool.map(p => Number(p[k])).filter(v => !isNaN(v));
+    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+    const variance = vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length;
+    stats[k] = {
+      mean,
+      std: Math.sqrt(variance) || 1
+    };
+  });
+  return pool.map(p => {
+    let sumsq = 0,
+      used = 0;
+    keys.forEach(k => {
+      const v = Number(p[k]);
+      if (!isNaN(v)) {
+        const z1 = (v - stats[k].mean) / stats[k].std;
+        const z2 = (Number(targetSubjects[k]) - stats[k].mean) / stats[k].std;
+        sumsq += (z1 - z2) ** 2;
+        used++;
+      }
+    });
+    return {
+      ...p,
+      _distance: used > 0 ? Math.sqrt(sumsq / used) : Infinity,
+      _usedCount: used
+    };
+  }).filter(p => p._usedCount >= Math.min(3, keys.length) && isFinite(p._distance)).sort((a, b) => a._distance - b._distance);
+}
+function SliderBox({
+  label,
+  value,
+  onChange
+}) {
+  const v = value === "" ? 0 : Number(value);
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 4,
+      minWidth: 130
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between"
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    style: {
+      fontSize: 12,
+      color: "#555",
+      fontWeight: 700
+    }
+  }, label), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      color: NAVY,
+      fontWeight: 700
+    }
+  }, value === "" ? "—" : value)), /*#__PURE__*/React.createElement("input", {
+    type: "range",
+    min: 0,
+    max: 100,
+    value: v,
+    onChange: e => onChange(e.target.value),
+    style: {
+      width: "100%",
+      accentColor: NAVY
+    }
+  }), /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    min: 0,
+    max: 100,
+    value: value,
+    onChange: e => onChange(e.target.value),
+    placeholder: "未入力",
+    style: {
+      width: "100%",
+      padding: "4px 6px",
+      border: "1.5px solid #ccc",
+      borderRadius: 5,
+      fontSize: 12.5
+    }
+  }));
+}
+function JudgeResultCard({
+  kansanNaishin,
+  top3,
+  target,
+  border
+}) {
+  if (kansanNaishin == null || top3 == null) return null;
+  const kansanTotal = kansanNaishin * (300 / 65) + top3 * (700 / 500);
+  const result = judge(kansanTotal, target, border);
+  const color = JUDGE_COLOR[result];
+  const toTargetRaw = Math.max(0, (target - kansanTotal) / (700 / 500));
+  const toBorderRaw = Math.max(0, (border - kansanTotal) / (700 / 500));
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 14,
+      flexWrap: "wrap",
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: CARDBG,
+      borderRadius: 8,
+      padding: "14px 20px"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#888"
+    }
+  }, "換算合計点（1000点満点）"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 22,
+      fontWeight: 800,
+      color: NAVY
+    }
+  }, kansanTotal.toFixed(0))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: CARDBG,
+      borderRadius: 8,
+      padding: "14px 20px"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#888"
+    }
+  }, "目標点との差"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 18,
+      fontWeight: 700,
+      color: kansanTotal >= target ? GREEN : CORAL
+    }
+  }, kansanTotal >= target ? "+" : "", (kansanTotal - target).toFixed(0))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: CARDBG,
+      borderRadius: 8,
+      padding: "14px 20px"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#888"
+    }
+  }, "ボーダーとの差"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 18,
+      fontWeight: 700,
+      color: kansanTotal >= border ? GREEN : CORAL
+    }
+  }, kansanTotal >= border ? "+" : "", (kansanTotal - border).toFixed(0)))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: `${color}18`,
+      border: `2px solid ${color}`,
+      borderRadius: 10,
+      padding: "16px 20px",
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: "#666"
+    }
+  }, "判定"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 26,
+      fontWeight: 800,
+      color
+    }
+  }, result)), result !== "安全圏" && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: "#555",
+      background: "#FFF8EC",
+      borderRadius: 8,
+      padding: "12px 16px"
+    }
+  }, result === "厳しいライン" && toBorderRaw > 0 && /*#__PURE__*/React.createElement("div", null, "ボーダー圏に届くには、5教科合計であと約 ", /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: CORAL
+    }
+  }, toBorderRaw.toFixed(0), "点"), " 必要です（演習点ベース）。"), toTargetRaw > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 4
+    }
+  }, "安全圏に届くには、5教科合計であと約 ", /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: AMBER
+    }
+  }, toTargetRaw.toFixed(0), "点"), " 必要です（演習点ベース）。")));
+}
+function ValidationNote({
+  validation
+}) {
+  if (!validation || validation.length === 0) return null;
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 16,
+      fontSize: 11.5,
+      color: "#888"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      marginBottom: 4,
+      color: "#666"
+    }
+  }, "参考：2017〜2025年度卒・八王子教室でのこの判定の実績"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 16,
+      flexWrap: "wrap"
+    }
+  }, validation.map(v => /*#__PURE__*/React.createElement("div", {
+    key: v.判定,
+    style: {
+      background: "#FAFAFA",
+      borderRadius: 6,
+      padding: "8px 14px"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontWeight: 700,
+      color: JUDGE_COLOR[v.判定]
+    }
+  }, v.判定), " ", "→ 実際の合格率 ", /*#__PURE__*/React.createElement("b", null, v["合格率(%)"], "%"), "（", v.検証件数, "件中）"))));
+}
+function WeakSubjectPanel({
+  studentSubjects,
+  schoolProfileRow
+}) {
+  if (!schoolProfileRow) return null;
+  const count = schoolProfileRow["国語_count"];
+  if (!count || count < 3) {
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 12.5,
+        color: "#999",
+        marginTop: 16
+      }
+    }, "この志望校は、合格者の演習データが少なく（3名未満）、教科別の比較は参考にできません。");
+  }
+  const diffs = SUBJECTS.map(s => {
+    const mine = studentSubjects[s];
+    const avg = schoolProfileRow[`${s}_mean`];
+    if (mine == null || mine === "" || avg == null) return null;
+    return {
+      subject: s,
+      mine: Number(mine),
+      avg: Number(avg),
+      diff: Number(mine) - Number(avg)
+    };
+  }).filter(Boolean);
+  if (diffs.length === 0) return null;
+  const weakest = [...diffs].sort((a, b) => a.diff - b.diff)[0];
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 20
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      fontSize: 14,
+      color: NAVY,
+      marginBottom: 4
+    }
+  }, "教科別診断（合格者平均との比較、", count, "名分のデータに基づく）"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 12,
+      flexWrap: "wrap",
+      marginBottom: 10
+    }
+  }, diffs.map(d => /*#__PURE__*/React.createElement("div", {
+    key: d.subject,
+    style: {
+      background: d.diff < -5 ? "#FDECEA" : d.diff > 5 ? "#EAF6EC" : CARDBG,
+      border: d.subject === weakest.subject && d.diff < 0 ? `2px solid ${CORAL}` : "1px solid #eee",
+      borderRadius: 8,
+      padding: "10px 16px",
+      minWidth: 110
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: "#888"
+    }
+  }, d.subject), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 16,
+      fontWeight: 800,
+      color: d.diff < 0 ? CORAL : GREEN
+    }
+  }, d.diff >= 0 ? "+" : "", d.diff.toFixed(0)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#aaa"
+    }
+  }, "あなた", d.mine, " / 合格者平均", d.avg.toFixed(0))))), weakest.diff < 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      background: "#FDECEA",
+      borderRadius: 8,
+      padding: "12px 16px",
+      color: "#8a2e1f"
+    }
+  }, "最も合格者平均を下回っているのは", /*#__PURE__*/React.createElement("b", null, "「", weakest.subject, "」"), "（合格者平均より", Math.abs(weakest.diff).toFixed(0), "点低い）です。 優先して伸ばすべき教科として検討してください。"));
+}
+function SimilarStudentsPanel({
+  results,
+  anonymize,
+  onSelect
+}) {
+  if (results.length === 0) {
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 12.5,
+        color: "#999",
+        marginTop: 20
+      }
+    }, "条件に近い歴代生徒が見つかりませんでした。");
+  }
+  const anonLabel = i => "生徒" + String.fromCharCode(65 + i);
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 20
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      fontSize: 14,
+      color: NAVY,
+      marginBottom: 4
+    }
+  }, "③ 似ている歴代生徒（教科別の点数プロファイルが近い順）"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: "#888",
+      marginBottom: 10
+    }
+  }, "実際に演習・受験した生徒の実例です。「詳細」で演習全履歴を確認できます。"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    style: {
+      width: "100%",
+      borderCollapse: "collapse",
+      fontSize: 12.5
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", {
+    style: {
+      background: NAVY,
+      color: WHITE
+    }
+  }, /*#__PURE__*/React.createElement("th", {
+    style: th
+  }, "氏名"), /*#__PURE__*/React.createElement("th", {
+    style: th
+  }, "出身中学"), /*#__PURE__*/React.createElement("th", {
+    style: th
+  }, "受験校"), /*#__PURE__*/React.createElement("th", {
+    style: th
+  }, "結果"), /*#__PURE__*/React.createElement("th", {
+    style: th
+  }, "換算内申"), /*#__PURE__*/React.createElement("th", {
+    style: th
+  }, "類似度"), /*#__PURE__*/React.createElement("th", {
+    style: th
+  }))), /*#__PURE__*/React.createElement("tbody", null, results.slice(0, 5).map((r, i) => /*#__PURE__*/React.createElement("tr", {
+    key: r.会員番号,
+    style: {
+      background: i % 2 === 0 ? WHITE : "#FAFBFD"
+    }
+  }, /*#__PURE__*/React.createElement("td", {
+    style: td
+  }, anonymize ? anonLabel(i) : r.氏名), /*#__PURE__*/React.createElement("td", {
+    style: td
+  }, r.学校名), /*#__PURE__*/React.createElement("td", {
+    style: td
+  }, r.受験校), /*#__PURE__*/React.createElement("td", {
+    style: {
+      ...td,
+      fontWeight: 700,
+      color: r.合否 === "合格" ? GREEN : CORAL
+    }
+  }, r.合否), /*#__PURE__*/React.createElement("td", {
+    style: td
+  }, r.換算内申), /*#__PURE__*/React.createElement("td", {
+    style: td
+  }, r._distance.toFixed(2)), /*#__PURE__*/React.createElement("td", {
+    style: td
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => onSelect(r.会員番号),
+    style: {
+      background: TEAL,
+      color: WHITE,
+      border: "none",
+      borderRadius: 6,
+      padding: "5px 12px",
+      fontSize: 12,
+      fontWeight: 700,
+      cursor: "pointer"
+    }
+  }, "詳細"))))))));
+}
+function StudentDetailModal({
+  practice,
+  memberId,
+  anonymize,
+  index,
+  onClose
+}) {
+  const records = practice.filter(p => p.会員番号 === memberId);
+  if (records.length === 0) return null;
+  const meta = records[0];
+  const displayName = anonymize ? "生徒" + String.fromCharCode(65 + index) : meta.氏名;
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "fixed",
+      inset: 0,
+      background: "rgba(20,30,40,0.5)",
+      zIndex: 50,
+      display: "flex",
+      alignItems: "flex-start",
+      justifyContent: "center",
+      overflowY: "auto",
+      padding: "30px 16px"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: WHITE,
+      borderRadius: 14,
+      maxWidth: 700,
+      width: "100%",
+      padding: 28,
+      position: "relative"
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: onClose,
+    style: {
+      position: "absolute",
+      top: 18,
+      right: 18,
+      background: "#EEE",
+      border: "none",
+      borderRadius: 8,
+      width: 32,
+      height: 32,
+      fontSize: 16,
+      cursor: "pointer",
+      color: "#555"
+    }
+  }, "✕"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: TEAL,
+      letterSpacing: 1,
+      marginBottom: 4
+    }
+  }, "演習履歴"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 22,
+      fontWeight: 800,
+      color: NAVY,
+      marginBottom: 16
+    }
+  }, displayName, "（換算内申 ", meta.換算内申, "）"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    style: {
+      width: "100%",
+      borderCollapse: "collapse",
+      fontSize: 12.5
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", {
+    style: {
+      background: "#8C9BC4",
+      color: WHITE
+    }
+  }, /*#__PURE__*/React.createElement("th", {
+    style: th
+  }, "演習"), SUBJECTS.map(s => /*#__PURE__*/React.createElement("th", {
+    key: s,
+    style: {
+      ...th,
+      textAlign: "center"
+    }
+  }, s)), /*#__PURE__*/React.createElement("th", {
+    style: {
+      ...th,
+      textAlign: "center"
+    }
+  }, "合計"))), /*#__PURE__*/React.createElement("tbody", null, records.map((r, i) => /*#__PURE__*/React.createElement("tr", {
+    key: i,
+    style: {
+      background: i % 2 === 0 ? WHITE : "#FAFBFD"
+    }
+  }, /*#__PURE__*/React.createElement("td", {
+    style: {
+      ...td,
+      fontWeight: 700
+    }
+  }, r.演習年度), SUBJECTS.map(s => /*#__PURE__*/React.createElement("td", {
+    key: s,
+    style: {
+      ...td,
+      textAlign: "center"
+    }
+  }, r[s] ?? "－")), /*#__PURE__*/React.createElement("td", {
+    style: {
+      ...td,
+      textAlign: "center",
+      fontWeight: 700
+    }
+  }, r.合計 ?? "－"))))))));
+}
 function App() {
   const {
     data,
@@ -1415,6 +1993,19 @@ function App() {
   const anonLabel = i => "生徒" + String.fromCharCode(65 + i);
   const [pool, setPool] = React.useState(null);
   const fileInputRef = React.useRef(null);
+
+  // ③志望校判定シミュレーター用の状態
+  const [shibouAttempts, setShibouAttempts] = React.useState([{
+    国語: "",
+    数学: "",
+    英語: "",
+    社会: "",
+    理科: ""
+  }]);
+  const [shibouNaishin, setShibouNaishin] = React.useState("");
+  const [shibouSchool, setShibouSchool] = React.useState("");
+  const [shibouGender, setShibouGender] = React.useState("男");
+  const [selectedShibouStudent, setSelectedShibouStudent] = React.useState(null);
   function handleSearch() {
     if (!data) return;
     const p = buildCandidatePool(data, grade, term, ctMonth);
@@ -1465,13 +2056,13 @@ function App() {
       fontSize: 24,
       fontWeight: 800
     }
-  }, "類似生徒検索ツール"), /*#__PURE__*/React.createElement("div", {
+  }, "養哲塾検索ツール"), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 13,
       color: "#CFE0EC",
       marginTop: 6
     }
-  }, "歴代生徒データをもとに、入塾判定・進路指導の客観的な参考資料を提示します"), /*#__PURE__*/React.createElement("div", {
+  }, "歴代生徒データをもとに、入塾判定・進路指導・志望校判定の客観的な参考資料を提示します"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       justifyContent: "space-between",
@@ -1563,7 +2154,21 @@ function App() {
       fontSize: 14,
       boxShadow: tab === "current" ? "none" : "0 1px 3px rgba(0,0,0,0.1)"
     }
-  }, "② 在籍生の立ち位置を見る")), /*#__PURE__*/React.createElement(SectionCard, {
+  }, "② 在籍生の立ち位置を見る"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setTab("shibou"),
+    style: {
+      flex: 1,
+      padding: "12px 0",
+      borderRadius: 8,
+      border: "none",
+      cursor: "pointer",
+      background: tab === "shibou" ? "#7A5FC4" : WHITE,
+      color: tab === "shibou" ? WHITE : "#555",
+      fontWeight: 700,
+      fontSize: 14,
+      boxShadow: tab === "shibou" ? "none" : "0 1px 3px rgba(0,0,0,0.1)"
+    }
+  }, "③ 志望校判定シミュレーター")), tab !== "shibou" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(SectionCard, {
     title: "対象の学年・時期",
     color: NAVY
   }, /*#__PURE__*/React.createElement("div", {
@@ -1875,7 +2480,175 @@ function App() {
     onClose: () => setSelectedStudent(null),
     anonymize: anonymize,
     results: results
-  }));
+  })), tab === "shibou" && (() => {
+    const schoolOptions = data.thresholds ? Array.from(new Set(data.thresholds.map(t => t.学校名))).sort() : [];
+    function getThreshold(name, g) {
+      return data.thresholds.find(t => t.学校名 === name && t.性別 === g) || null;
+    }
+    function getSchoolProfile(name) {
+      return data.schoolProfile.find(p => p.学校名 === name) || null;
+    }
+    const attemptTotals = shibouAttempts.map(a => {
+      const vals = SUBJECTS.map(s => a[s]).filter(v => v !== "" && v != null).map(Number);
+      return vals.length ? vals.reduce((x, y) => x + y, 0) : null;
+    });
+    const manualTop3 = top3Avg(attemptTotals);
+    const manualThreshold = shibouSchool ? getThreshold(shibouSchool, shibouGender) : null;
+    const manualSchoolProfile = shibouSchool ? getSchoolProfile(shibouSchool) : null;
+    const latestAttempt = shibouAttempts[shibouAttempts.length - 1];
+    const simResults = findSimilarStudents(data.studentProfiles, latestAttempt, null);
+    return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(SectionCard, {
+      title: "① 過去問演習の点数（スライダーで動かすと判定がリアルタイムに変わります）",
+      color: AMBER
+    }, shibouAttempts.map((a, i) => /*#__PURE__*/React.createElement("div", {
+      key: i,
+      style: {
+        marginBottom: 16,
+        paddingBottom: 16,
+        borderBottom: i < shibouAttempts.length - 1 ? "1px solid #eee" : "none"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 12,
+        color: "#888",
+        marginBottom: 8,
+        fontWeight: 700
+      }
+    }, i + 1, "回目", i === shibouAttempts.length - 1 ? "（弱点診断に使用）" : ""), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        gap: 14,
+        flexWrap: "wrap",
+        alignItems: "flex-start"
+      }
+    }, SUBJECTS.map(s => /*#__PURE__*/React.createElement(SliderBox, {
+      key: s,
+      label: s,
+      value: a[s],
+      onChange: v => {
+        const next = [...shibouAttempts];
+        next[i] = {
+          ...next[i],
+          [s]: v
+        };
+        setShibouAttempts(next);
+      }
+    })), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 13,
+        color: "#666",
+        paddingTop: 20
+      }
+    }, "合計: ", /*#__PURE__*/React.createElement("b", null, attemptTotals[i] != null ? attemptTotals[i] : "—")), shibouAttempts.length > 1 && /*#__PURE__*/React.createElement("button", {
+      onClick: () => setShibouAttempts(shibouAttempts.filter((_, idx) => idx !== i)),
+      style: {
+        background: "#EEE",
+        border: "none",
+        borderRadius: 6,
+        padding: "6px 10px",
+        cursor: "pointer",
+        fontSize: 12,
+        marginTop: 18
+      }
+    }, "削除")))), /*#__PURE__*/React.createElement("button", {
+      onClick: () => setShibouAttempts([...shibouAttempts, {
+        国語: "",
+        数学: "",
+        英語: "",
+        社会: "",
+        理科: ""
+      }]),
+      style: {
+        background: WHITE,
+        border: `1.5px solid ${AMBER}`,
+        color: AMBER,
+        borderRadius: 6,
+        padding: "6px 14px",
+        cursor: "pointer",
+        fontSize: 12.5,
+        fontWeight: 700,
+        marginTop: 4
+      }
+    }, "＋ 演習回を追加"), manualTop3 != null && /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginTop: 12,
+        fontSize: 13,
+        color: NAVY,
+        fontWeight: 700
+      }
+    }, "上位3回の平均: ", manualTop3.toFixed(1), " 点（500点満点）")), /*#__PURE__*/React.createElement(SectionCard, {
+      title: "換算内申・志望校",
+      color: TEAL
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        gap: 16,
+        flexWrap: "wrap"
+      }
+    }, /*#__PURE__*/React.createElement(NumberBox, {
+      label: "換算内申",
+      max: 65,
+      value: shibouNaishin,
+      onChange: setShibouNaishin
+    }), /*#__PURE__*/React.createElement(Select, {
+      label: "性別",
+      value: shibouGender,
+      onChange: setShibouGender,
+      options: [{
+        value: "男",
+        label: "男子"
+      }, {
+        value: "女",
+        label: "女子"
+      }]
+    }), /*#__PURE__*/React.createElement(Select, {
+      label: "志望校",
+      value: shibouSchool,
+      onChange: setShibouSchool,
+      options: [{
+        value: "",
+        label: "選択してください"
+      }, ...schoolOptions.map(s => ({
+        value: s,
+        label: s
+      }))]
+    }))), shibouSchool && shibouNaishin !== "" && manualTop3 != null && manualThreshold && /*#__PURE__*/React.createElement("div", {
+      style: {
+        background: WHITE,
+        borderRadius: 12,
+        padding: 20,
+        boxShadow: "0 2px 8px rgba(0,0,0,0.06)"
+      }
+    }, /*#__PURE__*/React.createElement(JudgeResultCard, {
+      kansanNaishin: Number(shibouNaishin),
+      top3: manualTop3,
+      target: manualThreshold.目標点,
+      border: manualThreshold.ボーダー
+    }), /*#__PURE__*/React.createElement(ValidationNote, {
+      validation: data.validation
+    }), /*#__PURE__*/React.createElement(WeakSubjectPanel, {
+      studentSubjects: latestAttempt,
+      schoolProfileRow: manualSchoolProfile
+    }), /*#__PURE__*/React.createElement(SimilarStudentsPanel, {
+      results: simResults,
+      anonymize: anonymize,
+      onSelect: setSelectedShibouStudent
+    })), shibouSchool && !manualThreshold && /*#__PURE__*/React.createElement("div", {
+      style: {
+        color: CORAL,
+        fontSize: 13
+      }
+    }, "この学校・性別の基準データが見つかりませんでした。"), selectedShibouStudent && (() => {
+      const idx = simResults.findIndex(r => r.会員番号 === selectedShibouStudent);
+      return /*#__PURE__*/React.createElement(StudentDetailModal, {
+        practice: data.practice,
+        memberId: selectedShibouStudent,
+        anonymize: anonymize,
+        index: idx >= 0 ? idx : 0,
+        onClose: () => setSelectedShibouStudent(null)
+      });
+    })());
+  })());
 }
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(/*#__PURE__*/React.createElement(App, null));
