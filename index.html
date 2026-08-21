@@ -407,9 +407,10 @@ function computeGrowth(data, memberId) {
   const naishinEnd = naishinRows.length ? Number(naishinRows[naishinRows.length - 1]["換算内申"]) : null;
   function ctSS(row) {
     if (!row) return null;
-    const v = row["5科_SS"] ?? row["3科_SS"];
+    // 新しい入力シート形式には偏差値がないため、生得点（5科優先）で伸びを見る
+    const v = row["5科"] ?? row["3科"];
     if (v != null) return Number(v);
-    const indiv = ["国", "数", "英", "理", "社"].map(s => row[s + "_SS"]).filter(x => x != null).map(Number);
+    const indiv = ["国", "数", "英", "理", "社"].map(s => row[s]).filter(x => x != null).map(Number);
     return indiv.length ? indiv.reduce((a, b) => a + b, 0) / indiv.length : null;
   }
   const ctStart = ctSS(ctRows[0]);
@@ -439,50 +440,140 @@ const GRADE_ORDER_G = {
   "３年": 200
 };
 
-// ---- 長形式（Excelの生データ）→横持ちへの変換（Pythonのpivot_tableと同じロジック） ----
-function pivotNaishin(rows) {
-  const groups = {};
-  rows.forEach(r => {
-    const key = r["会員番号"] + "_" + r["学年"] + "_" + r["学期"];
-    if (!groups[key]) groups[key] = {
-      会員番号: r["会員番号"],
-      学年: Number(r["学年"]),
-      学期: Number(r["学期"])
-    };
-    groups[key][r["教科"]] = r["評定"];
+// ---- 横持ち入力シート（ブロック形式）を読み取る共通ロジック ----
+function parseWideSheet(ws, blockLabelParser) {
+  const rows = XLSX.utils.sheet_to_json(ws, {
+    header: 1,
+    defval: null
   });
-  return Object.values(groups);
+  if (rows.length < 4) return [];
+  const topRow = rows[0];
+  const subjRow = rows[2];
+  const dataRows = rows.slice(3);
+  const blockOfCol = [];
+  let currentBlock = null;
+  for (let c = 0; c < subjRow.length; c++) {
+    if (topRow[c] != null && String(topRow[c]).trim() !== "") {
+      currentBlock = String(topRow[c]).trim();
+    }
+    blockOfCol[c] = currentBlock;
+  }
+  const records = [];
+  dataRows.forEach(row => {
+    const memberId = row[0];
+    if (memberId == null || memberId === "") return;
+    const blockData = {};
+    for (let c = 4; c < subjRow.length; c++) {
+      const block = blockOfCol[c];
+      const subj = subjRow[c] != null ? String(subjRow[c]).trim() : null;
+      const val = row[c];
+      if (block == null || subj == null || val == null || val === "") continue;
+      if (!blockData[block]) blockData[block] = {};
+      blockData[block][subj] = val;
+    }
+    Object.entries(blockData).forEach(([blockLabel, subjVals]) => {
+      const parsed = blockLabelParser(blockLabel);
+      if (parsed) records.push({
+        会員番号: Number(memberId),
+        ...parsed,
+        ...subjVals
+      });
+    });
+  });
+  return records;
 }
-function pivotTeiki(rows) {
-  const groups = {};
-  rows.forEach(r => {
-    const key = r["会員番号"] + "_" + r["学年"] + "_" + r["学期"] + "_" + r["種別"];
-    if (!groups[key]) groups[key] = {
-      会員番号: r["会員番号"],
-      学年: Number(r["学年"]),
-      学期: Number(r["学期"]),
-      種別: r["種別"]
+function pivotNaishin(ws) {
+  return parseWideSheet(ws, label => {
+    const m = label.match(/中(\d)-(\d)学期/);
+    if (!m) return null;
+    return {
+      学年: Number(m[1]),
+      学期: Number(m[2])
     };
-    groups[key][r["教科"]] = r["点数"];
   });
-  return Object.values(groups);
 }
-function pivotCT(rows) {
-  const groups = {};
-  rows.forEach(r => {
-    const key = r["会員番号"] + "_" + r["学年"] + "_" + r["実施月"];
-    if (!groups[key]) groups[key] = {
-      会員番号: r["会員番号"],
-      CT学年: r["学年"],
-      CT月: r["実施月"]
+function pivotTeiki(ws) {
+  return parseWideSheet(ws, label => {
+    const m = label.match(/中(\d)-(\d)学期\((.+)\)/);
+    if (!m) return null;
+    return {
+      学年: Number(m[1]),
+      学期: Number(m[2]),
+      種別: m[3]
     };
-    groups[key][r["教科"]] = r["得点"]; // 得点（生点数）: 検索(k近傍法)で使用
-    groups[key][r["教科"] + "_SS"] = r["偏差値"]; // 偏差値: 伸びの計算で使用
   });
-  return Object.values(groups);
+}
+function pivotCT(ws) {
+  const gradeLabelMap = {
+    1: "１年",
+    2: "２年",
+    3: "３年"
+  };
+  return parseWideSheet(ws, label => {
+    const m = label.match(/中(\d)-(.+)/);
+    if (!m) return null;
+    return {
+      CT学年: gradeLabelMap[Number(m[1])],
+      CT月: m[2]
+    };
+  });
 }
 
-// ---- Excelワークブックから、ツールが使う4テーブルを組み立てる ----
+// ---- 演習履歴（元の「入力シート」形式）を読み取る ----
+function pivotPractice(ws) {
+  const rows = XLSX.utils.sheet_to_json(ws, {
+    header: 1,
+    defval: null
+  });
+  if (rows.length < 6) return [];
+  const topRow = rows[2]; // ブロック見出し（10月CT、H11 等、スパース）
+  const subjRow = rows[3]; // 教科見出し（国,数,英,社,理,合計）
+  const dataRows = rows.slice(5);
+  const blockOfCol = [];
+  let currentBlock = null;
+  for (let c = 0; c < subjRow.length; c++) {
+    if (topRow[c] != null && String(topRow[c]).trim() !== "") {
+      currentBlock = String(topRow[c]).trim();
+    }
+    blockOfCol[c] = currentBlock;
+  }
+  const SUBJ_MAP = {
+    "国": "国語",
+    "数": "数学",
+    "英": "英語",
+    "社": "社会",
+    "理": "理科",
+    "合計": "合計"
+  };
+  const records = [];
+  dataRows.forEach(row => {
+    const memberId = row[1]; // 0-indexed col1 = 会員番号
+    if (memberId == null || memberId === "") return;
+    const name = row[2];
+    const kansanNaishin = row[4];
+    const blockData = {};
+    for (let c = 5; c < subjRow.length; c++) {
+      const block = blockOfCol[c];
+      const subjRaw = subjRow[c] != null ? String(subjRow[c]).trim() : null;
+      const subj = SUBJ_MAP[subjRaw];
+      const val = row[c];
+      if (block == null || subj == null || val == null || val === "") continue;
+      if (!blockData[block]) blockData[block] = {};
+      blockData[block][subj] = val;
+    }
+    Object.entries(blockData).forEach(([blockLabel, subjVals]) => {
+      if (subjVals.合計 == null && Object.keys(subjVals).length === 0) return;
+      records.push({
+        会員番号: Number(memberId),
+        氏名: name,
+        換算内申: kansanNaishin,
+        演習年度: blockLabel,
+        ...subjVals
+      });
+    });
+  });
+  return records;
+}
 function trimKeys(rows) {
   return rows.map(r => {
     const out = {};
@@ -510,13 +601,21 @@ function parseWorkbook(workbook) {
     卒業時換算内申: r["換算内申"],
     合否: r["合否"]
   }));
-  const naishin = pivotNaishin(sheet("内申"));
-  const teiki = pivotTeiki(sheet("定期考査"));
-  const ct = pivotCT(sheet("CT結果"));
+
+  // 内申・定期考査・CT結果は「内申17卒」のようにコホート別シートに分かれているため、
+  // 該当プレフィックスを持つシートをすべて探して結合する
+  function collectSheetsByPrefix(prefix) {
+    const names = Object.keys(workbook.Sheets).filter(n => n.startsWith(prefix));
+    if (names.length === 0) throw new Error(`「${prefix}」で始まるシートが見つかりません。`);
+    return names;
+  }
+  const naishin = collectSheetsByPrefix("内申").flatMap(n => pivotNaishin(workbook.Sheets[n]));
+  const teiki = collectSheetsByPrefix("定期考査").flatMap(n => pivotTeiki(workbook.Sheets[n]));
+  const ct = collectSheetsByPrefix("CT").flatMap(n => pivotCT(workbook.Sheets[n]));
 
   // ③志望校判定シミュレーター用のシート
   const thresholds = sheet("基準点");
-  const practice = sheet("演習履歴");
+  const practice = pivotPractice(workbook.Sheets["演習履歴"]);
   const validation = sheet("検証結果");
   const schoolProfile = sheet("合格者教科プロファイル");
   const studentProfiles = sheet("生徒プロファイル");
